@@ -1,17 +1,14 @@
 import argparse
 import ast
 import difflib
-import os
+import re
 import sys
 from collections import Counter
 from pathlib import Path
 
-try:
-    import ollama
-except ImportError:  # pragma: no cover - depende del entorno de ejecución
-    ollama = None
+import ollama
 
-MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
+MODELO_POR_DEFECTO = "qwen2.5-coder:7b"
 
 CARPETAS_IGNORADAS = {"venv", ".venv", "__pycache__", ".git", "tests", "test", "migrations", "build", "dist"}
 
@@ -32,27 +29,8 @@ PLANTILLAS_ESTILO = {
 }
 
 
-def _normalizar_estilo(estilo: str | None) -> str:
-    estilo = (estilo or "google").lower()
-    return estilo if estilo in PLANTILLAS_ESTILO else "google"
-
-
-def _resumen_desde_nombre(nombre: str) -> str:
-    if not nombre:
-        return "Realiza la operación solicitada."
-    nombre = nombre.replace("_", " ").strip()
-    if "" not in nombre:
-        return f"Ejecuta la lógica de {nombre}."
-    nombre_limpio = nombre.split()[0]
-    if nombre_limpio.lower() in {"__init__", "__enter__", "__exit__"}:
-        return "Inicializa el estado del objeto."
-    return f"Ejecuta la lógica de {nombre}."
-
-
 def detectar_estilo_docstrings(archivos: list[Path]) -> str:
-    """Detecta el estilo dominante de docstrings del proyecto."""
     conteo = Counter()
-
     for archivo in archivos:
         try:
             codigo_fuente = archivo.read_text(encoding="utf-8")
@@ -66,7 +44,6 @@ def detectar_estilo_docstrings(archivos: list[Path]) -> str:
             doc = ast.get_docstring(nodo)
             if not doc:
                 continue
-
             if "-------" in doc or "Parameters" in doc:
                 conteo["numpy"] += 1
             elif ":param" in doc or ":returns:" in doc:
@@ -80,7 +57,6 @@ def detectar_estilo_docstrings(archivos: list[Path]) -> str:
 
 
 def encontrar_funciones_sin_documentar(ruta_archivo: Path) -> list[dict]:
-    """Devuelve funciones y clases sin docstring en la posición correcta para inyectarlos."""
     codigo_fuente = ruta_archivo.read_text(encoding="utf-8")
     arbol = ast.parse(codigo_fuente, filename=str(ruta_archivo))
 
@@ -105,89 +81,30 @@ def encontrar_funciones_sin_documentar(ruta_archivo: Path) -> list[dict]:
             and primer_stmt.value.value is Ellipsis
         )
 
-        codigo_del_nodo = ast.get_source_segment(codigo_fuente, nodo)
-        encontrados.append(
-            {
-                "nombre": nodo.name,
-                "tipo": "función" if es_funcion else "clase",
-                "linea_insercion": primer_stmt.lineno,
-                "indentacion": " " * primer_stmt.col_offset,
-                "codigo": codigo_del_nodo or "",
-                "trivial": es_trivial,
-            }
-        )
+        encontrados.append({
+            "nombre": nodo.name,
+            "tipo": "función" if es_funcion else "clase",
+            "linea_insercion": primer_stmt.lineno,
+            "indentacion": " " * primer_stmt.col_offset,
+            "codigo": ast.get_source_segment(codigo_fuente, nodo),
+            "trivial": es_trivial,
+        })
 
     encontrados.sort(key=lambda x: x["linea_insercion"], reverse=True)
     return encontrados
 
 
-def _extraer_nodo_desde_codigo(codigo: str):
-    try:
-        arbol = ast.parse(codigo)
-    except SyntaxError:
-        return None
-    return arbol.body[0] if arbol.body else None
+def generar_docstring(codigo: str, estilo: str, modelo: str) -> str:
+    """Le pide al modelo local que genere un docstring en el estilo indicado.
 
+    Args:
+        codigo: El código fuente de la función o clase.
+        estilo: Una de "google", "numpy", "rest" — determina el formato pedido.
+        modelo: Nombre del modelo de Ollama a usar (ej. "qwen2.5-coder:7b").
 
-def _generar_fallback_docstring(codigo: str, estilo: str) -> str:
-    nodo = _extraer_nodo_desde_codigo(codigo)
-    if nodo is None:
-        return "Documento la lógica de esta sección con una descripción clara y precisa."
-
-    def _descripcion_arg(arg_name: str) -> str:
-        return f"Descripción del parámetro {arg_name}."
-
-    if isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        resumen = _resumen_desde_nombre(nodo.name)
-        argumentos = []
-        for arg in nodo.args.posonlyargs + nodo.args.args + nodo.args.kwonlyargs:
-            argumentos.append(f"    {arg.arg}: {_descripcion_arg(arg.arg)}")
-        if nodo.args.vararg:
-            argumentos.append(f"    {nodo.args.vararg.arg}: Argumentos variables adicionales.")
-        if nodo.args.kwarg:
-            argumentos.append(f"    {nodo.args.kwarg.arg}: Argumentos de palabra clave adicionales.")
-
-        if estilo == "numpy":
-            lineas = [resumen, "", "Parameters", "----------"]
-            if argumentos:
-                lineas.extend(f"{arg.split(':', 1)[0]} : {' '.join(arg.split(':', 1)[1:]).strip()}" for arg in argumentos)
-            else:
-                lineas.append("None")
-            lineas.extend(["", "Returns", "-------", "resultado : Any", "    Resultado de la operación."])
-            return "\n".join(lineas)
-
-        if estilo == "rest":
-            lineas = [resumen, ""]
-            if argumentos:
-                for arg in argumentos:
-                    nombre, _, desc = arg.partition(":")
-                    lineas.append(f":param {nombre.strip()}: {desc.strip()}")
-            lineas.append(":returns: Resultado de la operación.")
-            return "\n".join(lineas)
-
-        lineas = [resumen, ""]
-        if argumentos:
-            lineas.append("Args:")
-            lineas.extend(f"    {arg}" for arg in argumentos)
-            lineas.append("")
-        lineas.append("Returns:")
-        lineas.append("    Resultado de la operación.")
-        return "\n".join(lineas)
-
-    if isinstance(nodo, ast.ClassDef):
-        resumen = f"Representa una {nodo.name.lower()} del sistema."
-        if estilo == "numpy":
-            return f"{resumen}\n\nAttributes\n----------\nNone\n    No hay atributos documentados de forma específica."
-        if estilo == "rest":
-            return f"{resumen}\n\n:attribute: Representa la entidad asociada al tipo {nodo.name}."
-        return f"{resumen}\n\nAttributes:\n    None: No hay atributos documentados de forma específica."
-
-    return "Documenta la intención y el comportamiento de esta sección de forma clara."
-
-
-def generar_docstring(codigo: str, estilo: str) -> str:
-    """Genera el contenido de un docstring usando LLM si está disponible y cae a heurística segura."""
-    estilo = _normalizar_estilo(estilo)
+    Returns:
+        El docstring generado, limpio y sin comillas triples ni markdown.
+    """
     instrucciones_estilo = PLANTILLAS_ESTILO.get(estilo, PLANTILLAS_ESTILO["google"])
     system_prompt = (
         "Eres un asistente experto en documentar código Python. "
@@ -195,35 +112,56 @@ def generar_docstring(codigo: str, estilo: str) -> str:
         "para el código dado. "
         f"{instrucciones_estilo}\n\n"
         "Reglas estrictas, sin excepción:\n"
-        "1. Responde SOLO con el texto del docstring. Nada de comillas triples ni markdown.\n"
+        "1. Responde SOLO con el texto del docstring. Nada de comillas triples "
+        "(las agrega el programa), nada de bloques markdown (nunca uses ```).\n"
         "2. NO repitas ni reescribas el código de la función. Solo el docstring.\n"
-        "3. Incluye 'Raises' sólo si el código tiene raise explícito.\n"
-        "4. No agregues explicaciones antes o después del docstring.\n"
-        "5. Mantén el docstring en español, claro y profesional.\n"
-        "6. Si el código no tiene parámetros, no incluyas 'Args:'.\n"
-        "7. Si el código no tiene retorno, no incluyas 'Returns:'.\n"
+        "3. Incluye una sección 'Raises' ÚNICAMENTE si el código tiene un "
+        "'raise' explícito. Si el código no lanza excepciones, NO inventes una "
+        "sección Raises.\n"
+        "4. No agregues explicaciones antes o después del docstring.\n\n"
+        "Ejemplo de una respuesta correcta para una función que suma dos números:\n"
+        "Suma dos números y devuelve el resultado.\n\n"
+        "Args:\n"
+        "    a: Primer número.\n"
+        "    b: Segundo número.\n\n"
+        "Returns:\n"
+        "    La suma de a y b."
     )
 
-    fallback = _generar_fallback_docstring(codigo, estilo)
-    if ollama is None:
-        return fallback
+    respuesta = ollama.chat(
+        model=modelo,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": codigo},
+        ],
+        options={"temperature": 0.1},
+    )
+    return limpiar_docstring_generado(respuesta["message"]["content"])
 
-    try:
-        respuesta = ollama.chat(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": codigo},
-            ],
-        )
-        texto = respuesta["message"]["content"].strip()
-        texto_limpio = texto.strip('"').strip("'").strip()
-        if texto_limpio and not texto_limpio.startswith("```"):
-            return texto_limpio
-    except Exception:
-        pass
 
-    return fallback
+def limpiar_docstring_generado(texto_crudo: str) -> str:
+    """Limpia la respuesta cruda del modelo hasta dejar solo el docstring.
+
+    Args:
+        texto_crudo: La respuesta tal cual la devolvió el modelo.
+
+    Returns:
+        El texto del docstring, limpio y sin indentación sobrante.
+    """
+    texto = texto_crudo.strip()
+    texto = re.sub(r"^```[a-zA-Z]*\n?", "", texto)
+    texto = re.sub(r"\n?```$", "", texto).strip()
+
+    match = re.search(r'"""(.*?)"""', texto, re.DOTALL) or re.search(r"'''(.*?)'''", texto, re.DOTALL)
+    contenido = match.group(1) if match else texto
+
+    lineas = contenido.strip("\n").splitlines()
+    lineas_no_vacias = [l for l in lineas if l.strip()]
+    if lineas_no_vacias:
+        indent_min = min(len(l) - len(l.lstrip()) for l in lineas_no_vacias)
+        lineas = [l[indent_min:] if len(l) >= indent_min else l.strip() for l in lineas]
+
+    return "\n".join(lineas).strip()
 
 
 def construir_bloque_docstring(docstring: str, indentacion: str) -> list[str]:
@@ -237,8 +175,7 @@ def construir_bloque_docstring(docstring: str, indentacion: str) -> list[str]:
 
 def mostrar_diff(lineas_originales: list[str], lineas_nuevas: list[str], archivo: str) -> None:
     diff = difflib.unified_diff(
-        lineas_originales,
-        lineas_nuevas,
+        lineas_originales, lineas_nuevas,
         fromfile=f"{archivo} (original)",
         tofile=f"{archivo} (propuesto)",
         lineterm="",
@@ -247,8 +184,9 @@ def mostrar_diff(lineas_originales: list[str], lineas_nuevas: list[str], archivo
         print(linea)
 
 
-def procesar_archivo(archivo: Path, aprobar_todo: bool, estilo: str, reporte: Counter, dry_run: bool = False) -> bool:
-    """Procesa un archivo y aplica docstrings aprobados por el usuario o por aprobación global."""
+def procesar_archivo(
+    archivo: Path, aprobar_todo: bool, estilo: str, modelo: str, dry_run: bool, reporte: Counter
+) -> bool:
     try:
         sin_documentar = encontrar_funciones_sin_documentar(archivo)
     except SyntaxError as error:
@@ -266,21 +204,23 @@ def procesar_archivo(archivo: Path, aprobar_todo: bool, estilo: str, reporte: Co
 
     for item in sin_documentar:
         if item["trivial"]:
-            print(f"  (saltando '{item['nombre']}' — cuerpo trivial, no aporta documentar)")
+            print(f"  (saltando '{item['nombre']}' — cuerpo trivial)")
             reporte["saltadas_trivial"] += 1
             continue
 
-        print(f"\n  {item['tipo']} '{item['nombre']}' — generando propuesta ({estilo})...")
-        docstring = generar_docstring(item["codigo"], estilo)
+        print(f"\n  {item['tipo']} '{item['nombre']}' — generando propuesta ({estilo}, {modelo})...")
+        docstring = generar_docstring(item["codigo"], estilo, modelo)
         bloque = construir_bloque_docstring(docstring, item["indentacion"])
 
-        idx = max(item["linea_insercion"] - 1, 0)
-        lineas_propuestas = lineas_actuales[:idx] + [linea + "\n" for linea in bloque] + lineas_actuales[idx:]
+        idx = item["linea_insercion"] - 1
+        lineas_propuestas = (
+            lineas_actuales[:idx] + [linea + "\n" for linea in bloque] + lineas_actuales[idx:]
+        )
 
         mostrar_diff(lineas_actuales, lineas_propuestas, str(archivo))
 
         if dry_run:
-            print("  [dry-run] sin aplicar cambios")
+            reporte["propuestas_dry_run"] += 1
             continue
 
         if not aprobar_todo:
@@ -307,62 +247,81 @@ def procesar_archivo(archivo: Path, aprobar_todo: bool, estilo: str, reporte: Co
     return aprobar_todo
 
 
-def analizar_proyecto(ruta_proyecto: str, aprobar_todo: bool = False, estilo: str | None = None, dry_run: bool = False) -> Counter:
-    """Recorre un proyecto y genera la documentación solicitada."""
-    base = Path(ruta_proyecto)
-    if not base.exists():
-        raise FileNotFoundError(f"La ruta '{ruta_proyecto}' no existe.")
+def analizar_proyecto(ruta_proyecto: str, args: argparse.Namespace) -> None:
+    """Recorre un proyecto, detecta el estilo, documenta y muestra un reporte final.
 
+    Args:
+        ruta_proyecto: Ruta a la carpeta raíz del proyecto a documentar.
+        args: Argumentos ya parseados de la línea de comandos.
+    """
+    base = Path(ruta_proyecto)
     archivos_python = [
-        f for f in base.rglob("*.py")
-        if f.is_file() and not any(parte in CARPETAS_IGNORADAS for parte in f.parts)
+        f for f in base.rglob("*.py") if not any(parte in CARPETAS_IGNORADAS for parte in f.parts)
     ]
 
     if not archivos_python:
         print(f"No se encontraron archivos .py relevantes en {ruta_proyecto}")
-        return Counter()
+        return
 
-    estilo_detectado = detectar_estilo_docstrings(archivos_python)
-    estilo_final = _normalizar_estilo(estilo or estilo_detectado)
-    print(f"Estilo de docstring detectado en el proyecto: {estilo_final}")
-    print(f"Analizando {len(archivos_python)} archivo(s) Python (ignorando {', '.join(sorted(CARPETAS_IGNORADAS))})...")
+    estilo = args.estilo if args.estilo != "auto" else detectar_estilo_docstrings(archivos_python)
+    print(f"Estilo de docstring: {estilo}{' (auto-detectado)' if args.estilo == 'auto' else ' (forzado)'}")
+    print(f"Modelo: {args.modelo}")
+    if args.dry_run:
+        print("Modo DRY-RUN: no se escribirá ningún archivo, solo se mostrarán propuestas.")
+    print(f"Analizando {len(archivos_python)} archivo(s) (ignorando {', '.join(CARPETAS_IGNORADAS)})...")
 
+    aprobar_todo = args.yes
     reporte = Counter()
+
     for archivo in archivos_python:
-        aprobar_todo = procesar_archivo(archivo, aprobar_todo, estilo_final, reporte, dry_run=dry_run)
+        aprobar_todo = procesar_archivo(archivo, aprobar_todo, estilo, args.modelo, args.dry_run, reporte)
 
     total_encontradas = sum(reporte.values())
     print("\n" + "=" * 40)
     print("REPORTE FINAL")
     print("=" * 40)
-    print(f"Estilo usado:              {estilo_final}")
+    print(f"Estilo usado:              {estilo}")
     print(f"Total funciones/clases revisadas: {total_encontradas}")
-    print(f"  - Documentadas:          {reporte['documentadas']}")
+    if args.dry_run:
+        print(f"  - Propuestas (dry-run, sin escribir): {reporte['propuestas_dry_run']}")
+    else:
+        print(f"  - Documentadas:          {reporte['documentadas']}")
+        print(f"  - Saltadas (por ti):     {reporte['saltadas_usuario']}")
     print(f"  - Saltadas (triviales):  {reporte['saltadas_trivial']}")
-    print(f"  - Saltadas (por ti):     {reporte['saltadas_usuario']}")
     print(f"  - Saltadas (error sintaxis en archivo): {reporte['saltadas_error_sintaxis']}")
-    return reporte
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Documenta funciones y clases Python con estilo consistente.")
-    parser.add_argument("ruta_proyecto", help="Ruta a la carpeta raíz del proyecto a documentar.")
-    parser.add_argument("--estilo", choices=sorted(PLANTILLAS_ESTILO), help="Estilo de docstring a forzar.")
-    parser.add_argument("--aprobar-todo", action="store_true", help="Aplía automáticamente todos los cambios sugeridos.")
-    parser.add_argument("--dry-run", action="store_true", help="Muestra el diff sin modificar archivos.")
-    parser.add_argument("--modelo", default=MODEL, help="Modelo de Ollama a usar para la generación de docstrings.")
-    args = parser.parse_args(argv)
+def construir_parser() -> argparse.ArgumentParser:
+    """Construye el parser de argumentos de línea de comandos.
 
-    # global MODEL
-    # MODEL = args.modelo
-
-    try:
-        analizar_proyecto(args.ruta_proyecto, aprobar_todo=args.aprobar_todo, estilo=args.estilo, dry_run=args.dry_run)
-    except FileNotFoundError as error:
-        print(f"Error: {error}")
-        return 1
-    return 0
+    Returns:
+        El ArgumentParser configurado con todas las opciones del agente.
+    """
+    parser = argparse.ArgumentParser(
+        prog="doc_agent",
+        description="Agente local (Ollama) que documenta código Python automáticamente.",
+    )
+    parser.add_argument("ruta", help="Ruta a la carpeta del proyecto a documentar")
+    parser.add_argument(
+        "--modelo", default=MODELO_POR_DEFECTO,
+        help=f"Modelo de Ollama a usar (default: {MODELO_POR_DEFECTO})",
+    )
+    parser.add_argument(
+        "--estilo", choices=["auto", "google", "numpy", "rest"], default="auto",
+        help="Estilo de docstring a usar (default: auto-detecta del proyecto)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Muestra las propuestas sin escribir ningún archivo",
+    )
+    parser.add_argument(
+        "--yes", action="store_true",
+        help="Aprueba todos los cambios automáticamente, sin preguntar (útil en CI)",
+    )
+    return parser
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = construir_parser()
+    args = parser.parse_args()
+    analizar_proyecto(args.ruta, args)
