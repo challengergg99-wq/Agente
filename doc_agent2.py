@@ -8,7 +8,7 @@ from pathlib import Path
 
 import ollama
 
-MODELO_POR_DEFECTO = "qwen2.5-coder:7b"
+MODELO_POR_DEFECTO = "qwen2.5-coder:1.5b"
 
 CARPETAS_IGNORADAS = {"venv", ".venv", "__pycache__", ".git", "tests", "test", "migrations", "build", "dist"}
 
