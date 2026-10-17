@@ -1,27 +1,3 @@
-"""
-github_mcp_agent.py — Conecta un modelo local de Ollama al GitHub MCP Server.
-
-Qué hace:
-- Levanta el GitHub MCP Server oficial (vía Docker) como subproceso
-- Lista las herramientas que expone (crear PR, crear issue, leer archivos, etc.)
-- Las traduce al formato de "tools" que Ollama espera para tool calling
-- Corre un bucle: el modelo decide si necesita usar una herramienta, la
-  ejecuta contra GitHub real, y usa el resultado para responder
-
-Requisitos:
-    pip install mcp ollama
-    export GITHUB_PERSONAL_ACCESS_TOKEN=tu_token
-    docker pull ghcr.io/github/github-mcp-server
-
-IMPORTANTE: usa un modelo con soporte de tool calling, por ejemplo:
-    ollama pull llama3.1:8b
-(qwen2.5-coder puede no soportar tool calling — revisa la página del modelo
-en ollama.com, sección "Capabilities", antes de usarlo aquí).
-
-Uso:
-    python github_mcp_agent.py
-"""
-
 import asyncio
 import os
 
@@ -29,7 +5,7 @@ import ollama
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-MODELO = "llama3.1:8b"  # debe soportar tool calling
+MODELO = "llama3.1:8b" #para trabajar con ollama
 
 
 def esquema_mcp_a_ollama(tool) -> dict:
@@ -77,7 +53,6 @@ async def ejecutar_conversacion(session: ClientSession, herramientas_ollama: lis
     respuesta = ollama.chat(model=MODELO, messages=mensajes, tools=herramientas_ollama)
     mensaje = respuesta["message"]
 
-    # Si el modelo decidió usar una o más herramientas, las ejecutamos de verdad.
     llamadas = mensaje.get("tool_calls") or []
     if not llamadas:
         print("\nRespuesta del modelo (sin usar herramientas):")
@@ -129,7 +104,6 @@ async def main() -> None:
             for tool in resultado_tools.tools[:10]:
                 print(f"  - {tool.name}")
 
-            # Prueba rápida — cámbialo por tu propio prompt.
             await ejecutar_conversacion(
                 session,
                 herramientas_ollama,
