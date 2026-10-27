@@ -167,6 +167,18 @@ def servidor_github() -> StdioServerParameters:
         env={"GITHUB_PERSONAL_ACCESS_TOKEN": token, "PATH": os.environ.get("PATH", "")},
     )
 
+def esquema_de(tool) -> dict:
+    """Devuelve el esquema de parámetros de una tool, sin importar la versión del SDK.
+
+    Args:
+        tool: Objeto Tool devuelto por session.list_tools().
+
+    Returns:
+        El JSON Schema de entrada de la herramienta.
+    """
+    return getattr(tool, "inputSchema",None) or getattr(tool, "input_schema", None) or {}
+
+
 
 async def listar_tools() -> None:
     """Imprime las herramientas del servidor con sus parámetros reales."""
@@ -174,7 +186,7 @@ async def listar_tools() -> None:
         async with ClientSession(r, w) as s:
             await s.initialize()
             for t in (await s.list_tools()).tools:
-                props = list((t.inputSchema or {}).get("properties", {}))
+                props = list(esquema_de(t).get("properties", {}))
                 print(f"- {t.name}: {props}")
 
 
@@ -200,7 +212,7 @@ async def crear_pr(owner: str, repo: str, rama: str, base: str, titulo: str, cue
                 "head": rama, "base": base, "body": cuerpo,
             })
             texto = "\n".join(b.text for b in res.content if hasattr(b, "text"))
-            if res.isError:
+            if getattr(res, "is_error", None) or getattr(res, "isError", None):
                 raise SystemExit(f"El servidor MCP devolvió error:\n{texto}")
             return texto
 
