@@ -10,7 +10,13 @@ def es_anagrama(a: str, b: str) -> bool:
 print(es_anagrama("hola", "roma"))  # True
 
 
+def es_palindromo(s: str) -> bool:
+    if s is None:
+        return False
+    s_clean = "".join(c for c in s.lower() if c.isalnum())
+    return s_clean == s_clean[::-1]
 
+print(es_palindromo("A man, a plan, a canal: Panama"))  # True
 
 # if __name__ == "__main__":
 #     casos = [
